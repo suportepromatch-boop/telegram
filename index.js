@@ -3,6 +3,7 @@ require("dotenv").config();
 const TelegramBot = require("node-telegram-bot-api");
 const express = require("express");
 const axios = require("axios");
+const { Pool } = require("pg");
 
 // ======================================================
 // CONFIGURAÇÕES
@@ -15,11 +16,9 @@ const TELEGRAM_GROUP_ID = process.env.TELEGRAM_GROUP_ID;
 
 const ASAAS_API_KEY = process.env.ASAAS_API_KEY;
 const ASAAS_WEBHOOK_TOKEN = process.env.ASAAS_WEBHOOK_TOKEN;
+const ASAAS_PIX_KEY = process.env.ASAAS_PIX_KEY;
 
-// Sua chave PIX criada no Asaas
-const ASAAS_PIX_KEY =
-  process.env.ASAAS_PIX_KEY ||
-  "79b96cef-1cce-4c36-a5a6-c0e2cbf4c826";
+const DATABASE_URL = process.env.DATABASE_URL;
 
 const ASAAS_API_URL = "https://api.asaas.com/v3";
 
@@ -37,6 +36,16 @@ if (!ASAAS_API_KEY) {
   process.exit(1);
 }
 
+if (!ASAAS_PIX_KEY) {
+  console.error("ERRO: ASAAS_PIX_KEY não configurada.");
+  process.exit(1);
+}
+
+if (!DATABASE_URL) {
+  console.error("ERRO: DATABASE_URL não configurada.");
+  process.exit(1);
+}
+
 if (!TELEGRAM_GROUP_ID) {
   console.warn("AVISO: TELEGRAM_GROUP_ID não configurado.");
 }
@@ -46,25 +55,67 @@ if (!ASAAS_WEBHOOK_TOKEN) {
 }
 
 // ======================================================
+// POSTGRESQL
+// ======================================================
+
+const db = new Pool({
+  connectionString: DATABASE_URL,
+  ssl: {
+    rejectUnauthorized: false
+  }
+});
+
+// ======================================================
+// INICIALIZAR BANCO
+// ======================================================
+
+async function inicializarBanco() {
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS subscriptions (
+      id SERIAL PRIMARY KEY,
+
+      telegram_id BIGINT UNIQUE NOT NULL,
+      telegram_username TEXT,
+      first_name TEXT,
+
+      plan TEXT NOT NULL DEFAULT 'STARTER',
+      status TEXT NOT NULL DEFAULT 'PENDING',
+
+      pix_qr_code_id TEXT,
+      payment_id TEXT,
+
+      started_at TIMESTAMP,
+      expires_at TIMESTAMP,
+      last_payment_at TIMESTAMP,
+
+      created_at TIMESTAMP DEFAULT NOW(),
+      updated_at TIMESTAMP DEFAULT NOW()
+    );
+  `);
+
+  await db.query(`
+    CREATE INDEX IF NOT EXISTS idx_subscriptions_pix_qr_code
+    ON subscriptions (pix_qr_code_id);
+  `);
+
+  await db.query(`
+    CREATE INDEX IF NOT EXISTS idx_subscriptions_status
+    ON subscriptions (status);
+  `);
+
+  console.log("Banco de dados inicializado.");
+}
+
+// ======================================================
 // MEMÓRIA TEMPORÁRIA
 // ======================================================
 
-// QR Code ID -> Telegram ID
-//
-// Exemplo:
-// "9bea9bcd..." => "123456789"
-//
-// IMPORTANTE:
-// Essa estrutura é suficiente para testar.
-// Depois vamos trocar por banco de dados para sobreviver
-// a reinícios do Render.
+// Mesmo com banco, mantemos cache em memória para respostas rápidas.
+
 const qrCodeUsuarios = new Map();
 
-// Telegram ID -> QR Code atual
 const usuarioQrCodeAtual = new Map();
 
-// QR Codes que já tiveram acesso liberado.
-// Evita liberar duas vezes pelo mesmo evento.
 const qrCodesLiberados = new Set();
 
 // ======================================================
@@ -73,15 +124,17 @@ const qrCodesLiberados = new Set();
 
 const asaas = axios.create({
   baseURL: ASAAS_API_URL,
+
   headers: {
     access_token: ASAAS_API_KEY,
     "Content-Type": "application/json"
   },
+
   timeout: 15000
 });
 
 // ======================================================
-// TELEGRAM BOT
+// TELEGRAM
 // ======================================================
 
 const bot = new TelegramBot(
@@ -102,11 +155,13 @@ const app = express();
 app.use(express.json());
 
 // ======================================================
-// STATUS
+// STATUS DO SERVIDOR
 // ======================================================
 
 app.get("/", (req, res) => {
-  res.status(200).send("PROMATCH Bot online.");
+  res
+    .status(200)
+    .send("PROMATCH Bot online.");
 });
 
 // ======================================================
@@ -114,7 +169,6 @@ app.get("/", (req, res) => {
 // ======================================================
 
 async function criarQrCodePix(telegramId) {
-
   const response = await asaas.post(
     "/pix/qrCodes/static",
     {
@@ -129,7 +183,6 @@ async function criarQrCodePix(telegramId) {
       format:
         "ALL",
 
-      // QR exclusivo para uma única assinatura
       allowsMultiplePayments:
         false,
 
@@ -152,13 +205,11 @@ async function criarQrCodePix(telegramId) {
 async function consultarPagamentosQrCode(
   pixQrCodeId
 ) {
-
   const response = await asaas.get(
     "/payments",
     {
       params: {
-        pixQrCodeId:
-          pixQrCodeId
+        pixQrCodeId
       }
     }
   );
@@ -167,11 +218,185 @@ async function consultarPagamentosQrCode(
 }
 
 // ======================================================
+// REGISTRAR QR CODE NO BANCO
+// ======================================================
+
+async function registrarQrCode(
+  telegramUser,
+  pixQrCodeId
+) {
+  const telegramId =
+    telegramUser.id;
+
+  await db.query(
+    `
+    INSERT INTO subscriptions (
+      telegram_id,
+      telegram_username,
+      first_name,
+      plan,
+      status,
+      pix_qr_code_id,
+      updated_at
+    )
+    VALUES (
+      $1,
+      $2,
+      $3,
+      'STARTER',
+      'PENDING',
+      $4,
+      NOW()
+    )
+
+    ON CONFLICT (telegram_id)
+
+    DO UPDATE SET
+      telegram_username =
+        EXCLUDED.telegram_username,
+
+      first_name =
+        EXCLUDED.first_name,
+
+      pix_qr_code_id =
+        EXCLUDED.pix_qr_code_id,
+
+      status =
+        CASE
+          WHEN subscriptions.status = 'ACTIVE'
+          THEN subscriptions.status
+          ELSE 'PENDING'
+        END,
+
+      updated_at =
+        NOW()
+    `,
+    [
+      telegramId,
+      telegramUser.username || null,
+      telegramUser.first_name || null,
+      pixQrCodeId
+    ]
+  );
+
+  console.log(
+    `QR Code ${pixQrCodeId} registrado para Telegram ${telegramId}`
+  );
+}
+
+// ======================================================
+// BUSCAR TELEGRAM PELO QR CODE
+// ======================================================
+
+async function buscarTelegramPorQrCode(
+  pixQrCodeId
+) {
+  const result = await db.query(
+    `
+    SELECT telegram_id
+    FROM subscriptions
+    WHERE pix_qr_code_id = $1
+    LIMIT 1
+    `,
+    [
+      pixQrCodeId
+    ]
+  );
+
+  if (
+    result.rows.length === 0
+  ) {
+    return null;
+  }
+
+  return String(
+    result.rows[0].telegram_id
+  );
+}
+
+// ======================================================
+// BUSCAR ASSINATURA POR TELEGRAM
+// ======================================================
+
+async function buscarAssinatura(
+  telegramId
+) {
+  const result = await db.query(
+    `
+    SELECT *
+    FROM subscriptions
+    WHERE telegram_id = $1
+    LIMIT 1
+    `,
+    [
+      telegramId
+    ]
+  );
+
+  if (
+    result.rows.length === 0
+  ) {
+    return null;
+  }
+
+  return result.rows[0];
+}
+
+// ======================================================
+// MARCAR ASSINATURA ATIVA
+// ======================================================
+
+async function ativarAssinatura(
+  telegramId,
+  paymentId = null
+) {
+  await db.query(
+    `
+    UPDATE subscriptions
+
+    SET
+      status =
+        'ACTIVE',
+
+      started_at =
+        COALESCE(
+          started_at,
+          NOW()
+        ),
+
+      last_payment_at =
+        NOW(),
+
+      expires_at =
+        NOW() + INTERVAL '30 days',
+
+      payment_id =
+        COALESCE(
+          $2,
+          payment_id
+        ),
+
+      updated_at =
+        NOW()
+
+    WHERE telegram_id = $1
+    `,
+    [
+      telegramId,
+      paymentId
+    ]
+  );
+
+  console.log(
+    `Assinatura ativada para Telegram ${telegramId}`
+  );
+}
+
+// ======================================================
 // GERAR CONVITE INDIVIDUAL
 // ======================================================
 
 async function gerarConviteGrupo() {
-
   if (!TELEGRAM_GROUP_ID) {
     throw new Error(
       "TELEGRAM_GROUP_ID não configurado."
@@ -195,19 +420,75 @@ async function gerarConviteGrupo() {
 
 async function liberarAcesso(
   telegramId,
-  pixQrCodeId
+  pixQrCodeId,
+  paymentId = null
 ) {
+  // Evita processar duas vezes
+  // na mesma execução do servidor.
 
-  // Evita duplicidade de liberação
   if (
     pixQrCodeId &&
     qrCodesLiberados.has(
       pixQrCodeId
     )
   ) {
-
     console.log(
-      `Acesso já liberado para QR Code ${pixQrCodeId}`
+      `QR Code ${pixQrCodeId} já processado nesta instância.`
+    );
+
+    return;
+  }
+
+  // Verifica banco antes de ativar novamente.
+
+  const assinatura =
+    await buscarAssinatura(
+      telegramId
+    );
+
+  const jaAtivo =
+    assinatura &&
+    assinatura.status ===
+      "ACTIVE" &&
+    assinatura.expires_at &&
+    new Date(
+      assinatura.expires_at
+    ) > new Date();
+
+  // Ativa/renova por 30 dias.
+  //
+  // Por enquanto qualquer pagamento confirmado
+  // redefine o vencimento para +30 dias a partir de agora.
+  //
+  // Depois podemos alterar para somar 30 dias
+  // ao vencimento atual quando for renovação antecipada.
+
+  await ativarAssinatura(
+    telegramId,
+    paymentId
+  );
+
+  if (
+    pixQrCodeId
+  ) {
+    qrCodesLiberados.add(
+      pixQrCodeId
+    );
+  }
+
+  // Se já estava ativo, não precisamos
+  // obrigatoriamente gerar outro convite.
+
+  if (jaAtivo) {
+    await bot.sendMessage(
+      telegramId,
+      `✅ *Pagamento confirmado!*
+
+Sua assinatura *PROMATCH STARTER* foi renovada por mais 30 dias.`,
+      {
+        parse_mode:
+          "Markdown"
+      }
     );
 
     return;
@@ -222,7 +503,7 @@ async function liberarAcesso(
 
 Sua assinatura *PROMATCH STARTER* está ativa.
 
-Você já pode acessar nossa área exclusiva.
+Seu acesso foi liberado por *30 dias*.
 
 Clique abaixo para entrar:`,
     {
@@ -245,14 +526,6 @@ Clique abaixo para entrar:`,
     }
   );
 
-  if (pixQrCodeId) {
-
-    qrCodesLiberados.add(
-      pixQrCodeId
-    );
-
-  }
-
   console.log(
     `Acesso liberado para Telegram ${telegramId}`
   );
@@ -265,12 +538,10 @@ Clique abaixo para entrar:`,
 bot.onText(
   /\/start/,
   async (msg) => {
-
     const chatId =
       msg.chat.id;
 
     try {
-
       await bot.sendMessage(
         chatId,
         `🚀 *Bem-vindo à PROMATCH!*
@@ -302,14 +573,11 @@ Clique abaixo para iniciar sua assinatura.`,
       );
 
     } catch (error) {
-
       console.error(
         "Erro no /start:",
         error.message
       );
-
     }
-
   }
 );
 
@@ -320,7 +588,6 @@ Clique abaixo para iniciar sua assinatura.`,
 bot.onText(
   /\/id/,
   async (msg) => {
-
     const chatId =
       msg.chat.id;
 
@@ -328,7 +595,6 @@ bot.onText(
       msg.chat.type;
 
     try {
-
       await bot.sendMessage(
         chatId,
         `🔎 *Informações deste chat*
@@ -345,14 +611,84 @@ Tipo:
       );
 
     } catch (error) {
-
       console.error(
         "Erro no /id:",
         error.message
       );
-
     }
+  }
+);
 
+// ======================================================
+// /MINHAASSINATURA
+// ======================================================
+
+bot.onText(
+  /\/minhaassinatura/,
+  async (msg) => {
+    const telegramId =
+      msg.from.id;
+
+    try {
+      const assinatura =
+        await buscarAssinatura(
+          telegramId
+        );
+
+      if (!assinatura) {
+        await bot.sendMessage(
+          telegramId,
+          `Você ainda não possui uma assinatura cadastrada.
+
+Use /start para conhecer o plano STARTER.`
+        );
+
+        return;
+      }
+
+      let vencimento =
+        "Não definido";
+
+      if (
+        assinatura.expires_at
+      ) {
+        vencimento =
+          new Date(
+            assinatura.expires_at
+          )
+            .toLocaleDateString(
+              "pt-BR",
+              {
+                timeZone:
+                  "America/Sao_Paulo"
+              }
+            );
+      }
+
+      await bot.sendMessage(
+        telegramId,
+        `👤 *Minha assinatura*
+
+⭐ Plano:
+*${assinatura.plan}*
+
+📌 Status:
+*${assinatura.status}*
+
+📅 Vencimento:
+*${vencimento}*`,
+        {
+          parse_mode:
+            "Markdown"
+        }
+      );
+
+    } catch (error) {
+      console.error(
+        "Erro em /minhaassinatura:",
+        error.message
+      );
+    }
   }
 );
 
@@ -363,7 +699,6 @@ Tipo:
 bot.on(
   "callback_query",
   async (query) => {
-
     const chatId =
       query.message?.chat?.id;
 
@@ -375,7 +710,6 @@ bot.on(
     }
 
     try {
-
       await bot.answerCallbackQuery(
         query.id
       );
@@ -388,13 +722,12 @@ bot.on(
         query.data ===
         "assinar_starter"
       ) {
-
         await bot.sendMessage(
           chatId,
           `💠 *PROMATCH STARTER*
 
 💰 Valor: *R$ 49,90*
-📅 Acesso mensal
+📅 Acesso por 30 dias
 
 Clique abaixo para gerar seu pagamento via PIX.`,
           {
@@ -437,7 +770,6 @@ Clique abaixo para gerar seu pagamento via PIX.`,
         query.data ===
         "gerar_pix"
       ) {
-
         await bot.sendMessage(
           chatId,
           `⏳ *Gerando seu pagamento PIX...*
@@ -449,6 +781,8 @@ Aguarde alguns segundos.`,
           }
         );
 
+        // Cria QR Code individual.
+
         const qrCode =
           await criarQrCodePix(
             telegramId
@@ -459,14 +793,13 @@ Aguarde alguns segundos.`,
           !qrCode.id ||
           !qrCode.payload
         ) {
-
           console.error(
-            "Resposta inesperada do QR Code:",
+            "Resposta inesperada do Asaas:",
             qrCode
           );
 
           throw new Error(
-            "Asaas não retornou id/payload do QR Code."
+            "Asaas não retornou ID/payload do QR Code."
           );
         }
 
@@ -474,8 +807,8 @@ Aguarde alguns segundos.`,
           `QR Code criado: ${qrCode.id}`
         );
 
-        // Salva vínculo:
-        // QR Code -> Telegram
+        // Cache em memória.
+
         qrCodeUsuarios.set(
           qrCode.id,
           String(telegramId)
@@ -483,6 +816,13 @@ Aguarde alguns segundos.`,
 
         usuarioQrCodeAtual.set(
           String(telegramId),
+          qrCode.id
+        );
+
+        // Banco permanente.
+
+        await registrarQrCode(
+          query.from,
           qrCode.id
         );
 
@@ -496,9 +836,9 @@ Aguarde alguns segundos.`,
 💰 Valor:
 *R$ 49,90*
 
-⏱ Este PIX é válido por aproximadamente *30 minutos*.
+⏱ PIX válido por aproximadamente *30 minutos*.
 
-Copie o código PIX abaixo:
+Copie o código abaixo:
 
 \`${qrCode.payload}\`
 
@@ -538,7 +878,7 @@ Após realizar o pagamento, clique em:
       }
 
       // ==================================================
-      // VERIFICAR QR CODE
+      // VERIFICAR PAGAMENTO
       // ==================================================
 
       if (
@@ -546,26 +886,31 @@ Após realizar o pagamento, clique em:
           "verificarqr_"
         )
       ) {
-
         const pixQrCodeId =
           query.data.replace(
             "verificarqr_",
             ""
           );
 
-        // Segurança:
-        // o QR precisa ter sido gerado por esse usuário
-        const donoDoQr =
+        // Descobre dono do QR.
+
+        let donoDoQr =
           qrCodeUsuarios.get(
             pixQrCodeId
           );
+
+        if (!donoDoQr) {
+          donoDoQr =
+            await buscarTelegramPorQrCode(
+              pixQrCodeId
+            );
+        }
 
         if (
           donoDoQr &&
           donoDoQr !==
             String(telegramId)
         ) {
-
           await bot.sendMessage(
             chatId,
             `❌ Este pagamento não pertence ao seu usuário.`
@@ -598,10 +943,10 @@ Após realizar o pagamento, clique em:
         if (
           pagamentoRecebido
         ) {
-
           await liberarAcesso(
             telegramId,
-            pixQrCodeId
+            pixQrCodeId,
+            pagamentoRecebido.id
           );
 
           return;
@@ -643,7 +988,6 @@ Caso tenha acabado de realizar o PIX, aguarde alguns segundos e tente novamente.
         query.data ===
         "voltar_inicio"
       ) {
-
         await bot.sendMessage(
           chatId,
           `🚀 *PROMATCH*
@@ -676,7 +1020,6 @@ Escolha seu plano:
       }
 
     } catch (error) {
-
       console.error(
         "Erro ao processar botão:",
         error.response?.data ||
@@ -684,7 +1027,6 @@ Escolha seu plano:
       );
 
       try {
-
         await bot.sendMessage(
           chatId,
           `❌ Não foi possível concluir esta operação.
@@ -692,19 +1034,13 @@ Escolha seu plano:
 Tente novamente em alguns instantes.`
         );
 
-      } catch (
-        telegramError
-      ) {
-
+      } catch (telegramError) {
         console.error(
           "Erro Telegram:",
           telegramError.message
         );
-
       }
-
     }
-
   }
 );
 
@@ -715,11 +1051,9 @@ Tente novamente em alguns instantes.`
 app.post(
   "/webhook/asaas",
   async (req, res) => {
-
     try {
-
       // ==================================================
-      // VALIDAR TOKEN DO ASAAS
+      // VALIDAR TOKEN
       // ==================================================
 
       const receivedToken =
@@ -730,7 +1064,6 @@ app.post(
       if (
         !ASAAS_WEBHOOK_TOKEN
       ) {
-
         console.error(
           "ASAAS_WEBHOOK_TOKEN não configurado."
         );
@@ -747,7 +1080,6 @@ app.post(
         receivedToken !==
           ASAAS_WEBHOOK_TOKEN
       ) {
-
         console.warn(
           "Webhook rejeitado: token inválido."
         );
@@ -760,7 +1092,7 @@ app.post(
       }
 
       // ==================================================
-      // EVENTO AUTORIZADO
+      // EVENTO
       // ==================================================
 
       const event =
@@ -770,11 +1102,12 @@ app.post(
         `Webhook autorizado: ${event?.event}`
       );
 
-      // Respondemos imediatamente ao Asaas
+      // Responde rapidamente ao Asaas.
+
       res.sendStatus(200);
 
       // ==================================================
-      // SÓ EVENTOS DE PAGAMENTO
+      // EVENTOS ACEITOS
       // ==================================================
 
       if (
@@ -783,7 +1116,6 @@ app.post(
         event.event !==
           "PAYMENT_CONFIRMED"
       ) {
-
         return;
       }
 
@@ -791,7 +1123,6 @@ app.post(
         event.payment;
 
       if (!payment) {
-
         console.warn(
           "Webhook sem objeto payment."
         );
@@ -800,41 +1131,40 @@ app.post(
       }
 
       // ==================================================
-      // PEGAR ID DO QR CODE
+      // QR CODE
       // ==================================================
 
       const pixQrCodeId =
         payment.pixQrCodeId;
 
-      if (!pixQrCodeId) {
+      let telegramId =
+        null;
 
-        console.log(
-          "Pagamento recebido sem pixQrCodeId."
-        );
+      // 1. Tenta pelo QR Code em memória.
 
-        return;
+      if (
+        pixQrCodeId
+      ) {
+        telegramId =
+          qrCodeUsuarios.get(
+            pixQrCodeId
+          );
       }
 
-      console.log(
-        `Pagamento recebido para QR Code ${pixQrCodeId}`
-      );
+      // 2. Tenta pelo banco.
 
-      // ==================================================
-      // DESCOBRIR TELEGRAM DONO DO QR
-      // ==================================================
+      if (
+        !telegramId &&
+        pixQrCodeId
+      ) {
+        telegramId =
+          await buscarTelegramPorQrCode(
+            pixQrCodeId
+          );
+      }
 
-      let telegramId =
-        qrCodeUsuarios.get(
-          pixQrCodeId
-        );
+      // 3. Tenta pelo externalReference.
 
-      /*
-       * Tentativa adicional:
-       *
-       * Como criamos o QR Code com externalReference
-       * telegram_ID, verificamos também se o evento
-       * trouxe essa referência.
-       */
       if (
         !telegramId &&
         payment.externalReference &&
@@ -842,43 +1172,36 @@ app.post(
           "telegram_"
         )
       ) {
-
         telegramId =
           payment.externalReference.replace(
             "telegram_",
             ""
           );
-
       }
 
       if (!telegramId) {
-
         console.warn(
-          `QR Code ${pixQrCodeId} não encontrado na memória do bot.`
+          `Não foi possível identificar o Telegram do pagamento ${payment.id}`
         );
-
-        /*
-         * Isso pode acontecer caso o Render reinicie
-         * depois de gerar o QR Code e antes do pagamento.
-         *
-         * Quando adicionarmos banco de dados,
-         * esse problema deixa de existir.
-         */
 
         return;
       }
 
+      console.log(
+        `Pagamento confirmado para Telegram ${telegramId}`
+      );
+
       // ==================================================
-      // LIBERAR ACESSO
+      // LIBERAR / RENOVAR
       // ==================================================
 
       await liberarAcesso(
         telegramId,
-        pixQrCodeId
+        pixQrCodeId,
+        payment.id
       );
 
     } catch (error) {
-
       console.error(
         "Erro no Webhook Asaas:",
         error.response?.data ||
@@ -888,17 +1211,13 @@ app.post(
       if (
         !res.headersSent
       ) {
-
         res
           .status(500)
           .send(
             "Internal Server Error"
           );
-
       }
-
     }
-
   }
 );
 
@@ -909,12 +1228,10 @@ app.post(
 bot.on(
   "polling_error",
   (error) => {
-
     console.error(
       "Telegram polling error:",
       error.message
     );
-
   }
 );
 
@@ -925,38 +1242,48 @@ bot.on(
 process.on(
   "unhandledRejection",
   (reason) => {
-
     console.error(
       "Unhandled Rejection:",
       reason
     );
-
   }
 );
 
 process.on(
   "uncaughtException",
   (error) => {
-
     console.error(
       "Uncaught Exception:",
       error
     );
-
   }
 );
 
 // ======================================================
-// SERVIDOR
+// INICIAR BANCO E SERVIDOR
 // ======================================================
 
-app.listen(
-  PORT,
-  () => {
+async function iniciarSistema() {
+  try {
+    await inicializarBanco();
 
-    console.log(
-      `Servidor PROMATCH rodando na porta ${PORT}`
+    app.listen(
+      PORT,
+      () => {
+        console.log(
+          `Servidor PROMATCH rodando na porta ${PORT}`
+        );
+      }
     );
 
+  } catch (error) {
+    console.error(
+      "Erro ao iniciar sistema:",
+      error
+    );
+
+    process.exit(1);
   }
-);
+}
+
+iniciarSistema();
