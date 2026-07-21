@@ -14,8 +14,11 @@ const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const TELEGRAM_GROUP_ID = process.env.TELEGRAM_GROUP_ID;
 const ASAAS_API_KEY = process.env.ASAAS_API_KEY;
 
+// API Asaas Produção
+const ASAAS_API_URL = "https://api.asaas.com/v3";
+
 // ======================================================
-// VALIDAÇÕES DE AMBIENTE
+// VALIDAÇÕES
 // ======================================================
 
 if (!TELEGRAM_BOT_TOKEN) {
@@ -23,11 +26,25 @@ if (!TELEGRAM_BOT_TOKEN) {
   process.exit(1);
 }
 
-// Por enquanto não vamos obrigar ASAAS_API_KEY e TELEGRAM_GROUP_ID,
-// porque ainda estamos testando o bot e os botões.
+if (!ASAAS_API_KEY) {
+  console.error("ERRO: ASAAS_API_KEY não configurada.");
+  process.exit(1);
+}
 
 // ======================================================
-// TELEGRAM BOT
+// CLIENTE ASAAS
+// ======================================================
+
+const asaas = axios.create({
+  baseURL: ASAAS_API_URL,
+  headers: {
+    access_token: ASAAS_API_KEY,
+    "Content-Type": "application/json"
+  }
+});
+
+// ======================================================
+// TELEGRAM
 // ======================================================
 
 const bot = new TelegramBot(TELEGRAM_BOT_TOKEN, {
@@ -37,7 +54,7 @@ const bot = new TelegramBot(TELEGRAM_BOT_TOKEN, {
 console.log("PROMATCH Bot iniciado.");
 
 // ======================================================
-// SERVIDOR EXPRESS
+// EXPRESS
 // ======================================================
 
 const app = express();
@@ -45,7 +62,7 @@ const app = express();
 app.use(express.json());
 
 // ======================================================
-// ROTA DE STATUS
+// STATUS
 // ======================================================
 
 app.get("/", (req, res) => {
@@ -53,13 +70,167 @@ app.get("/", (req, res) => {
 });
 
 // ======================================================
-// COMANDO /START
+// FUNÇÃO: CRIAR CLIENTE ASAAS
+// ======================================================
+
+async function criarClienteAsaas(usuario) {
+
+  const telegramId = usuario.id;
+
+  const nome =
+    [usuario.first_name, usuario.last_name]
+      .filter(Boolean)
+      .join(" ") ||
+    `Telegram ${telegramId}`;
+
+  const response = await asaas.post(
+    "/customers",
+    {
+      name: nome,
+
+      // Serve para relacionar o cliente
+      // com nosso usuário do Telegram.
+      externalReference: `telegram_${telegramId}`,
+
+      notificationDisabled: true
+    }
+  );
+
+  return response.data;
+}
+
+// ======================================================
+// FUNÇÃO: CRIAR COBRANÇA PIX
+// ======================================================
+
+async function criarCobrancaPix(
+  customerId,
+  telegramId
+) {
+
+  const hoje = new Date();
+
+  // Cobrança vence hoje.
+  const dueDate =
+    hoje.toISOString().split("T")[0];
+
+  const response = await asaas.post(
+    "/payments",
+    {
+      customer: customerId,
+
+      billingType: "PIX",
+
+      value: 49.90,
+
+      dueDate: dueDate,
+
+      description:
+        "PROMATCH STARTER - assinatura mensal",
+
+      externalReference:
+        `telegram_${telegramId}`
+    }
+  );
+
+  return response.data;
+}
+
+// ======================================================
+// FUNÇÃO: BUSCAR QR CODE PIX
+// ======================================================
+
+async function buscarPix(paymentId) {
+
+  const response = await asaas.get(
+    `/payments/${paymentId}/pixQrCode`
+  );
+
+  return response.data;
+}
+
+// ======================================================
+// FUNÇÃO: CONSULTAR PAGAMENTO
+// ======================================================
+
+async function consultarPagamento(paymentId) {
+
+  const response = await asaas.get(
+    `/payments/${paymentId}`
+  );
+
+  return response.data;
+}
+
+// ======================================================
+// FUNÇÃO: GERAR CONVITE TELEGRAM
+// ======================================================
+
+async function gerarConviteGrupo() {
+
+  if (!TELEGRAM_GROUP_ID) {
+    throw new Error(
+      "TELEGRAM_GROUP_ID não configurado."
+    );
+  }
+
+  const invite =
+    await bot.createChatInviteLink(
+      TELEGRAM_GROUP_ID,
+      {
+        member_limit: 1
+      }
+    );
+
+  return invite.invite_link;
+}
+
+// ======================================================
+// FUNÇÃO: LIBERAR ACESSO
+// ======================================================
+
+async function liberarAcesso(telegramId) {
+
+  const inviteLink =
+    await gerarConviteGrupo();
+
+  await bot.sendMessage(
+    telegramId,
+    `✅ *Pagamento confirmado!*
+
+Sua assinatura *PROMATCH STARTER* está ativa.
+
+Você já pode acessar nossa área exclusiva.
+
+Clique abaixo para entrar:`,
+    {
+      parse_mode: "Markdown",
+
+      reply_markup: {
+        inline_keyboard: [
+          [
+            {
+              text:
+                "🚀 ENTRAR NO GRUPO",
+              url: inviteLink
+            }
+          ]
+        ]
+      }
+    }
+  );
+}
+
+// ======================================================
+// /START
 // ======================================================
 
 bot.onText(/\/start/, async (msg) => {
+
   const chatId = msg.chat.id;
 
   try {
+
     await bot.sendMessage(
       chatId,
       `🚀 *Bem-vindo à PROMATCH!*
@@ -72,33 +243,47 @@ Tenha acesso às nossas projeções exclusivas de E-Soccer.
 Clique abaixo para iniciar sua assinatura.`,
       {
         parse_mode: "Markdown",
+
         reply_markup: {
           inline_keyboard: [
             [
               {
-                text: "⭐ STARTER — R$ 49,90",
-                callback_data: "assinar_starter"
+                text:
+                  "⭐ STARTER — R$ 49,90",
+
+                callback_data:
+                  "assinar_starter"
               }
             ]
           ]
         }
       }
     );
+
   } catch (error) {
-    console.error("Erro no /start:", error.message);
+
+    console.error(
+      "Erro no /start:",
+      error.message
+    );
+
   }
+
 });
 
 // ======================================================
-// COMANDO /ID
-// Serve para descobrir o ID de um chat/grupo
+// /ID
 // ======================================================
 
 bot.onText(/\/id/, async (msg) => {
+
   const chatId = msg.chat.id;
-  const chatType = msg.chat.type;
+
+  const chatType =
+    msg.chat.type;
 
   try {
+
     await bot.sendMessage(
       chatId,
       `🔎 *Informações deste chat*
@@ -109,262 +294,457 @@ ID:
 Tipo:
 \`${chatType}\``,
       {
-        parse_mode: "Markdown"
+        parse_mode:
+          "Markdown"
       }
     );
+
   } catch (error) {
-    console.error("Erro no /id:", error.message);
+
+    console.error(
+      "Erro no /id:",
+      error.message
+    );
+
   }
+
 });
 
 // ======================================================
-// CLIQUES NOS BOTÕES
+// CALLBACK DOS BOTÕES
 // ======================================================
 
-bot.on("callback_query", async (query) => {
-  const chatId = query.message?.chat?.id;
-  const telegramId = query.from.id;
+bot.on(
+  "callback_query",
+  async (query) => {
 
-  if (!chatId) {
-    return;
-  }
+    const chatId =
+      query.message?.chat?.id;
 
-  try {
-    // Remove o ícone de carregamento do botão
-    await bot.answerCallbackQuery(query.id);
+    const telegramId =
+      query.from.id;
 
-    // ==================================================
-    // BOTÃO STARTER
-    // ==================================================
+    if (!chatId) {
+      return;
+    }
 
-    if (query.data === "assinar_starter") {
-      await bot.sendMessage(
-        chatId,
-        `💠 *PROMATCH STARTER*
+    try {
+
+      await bot.answerCallbackQuery(
+        query.id
+      );
+
+      // ==================================================
+      // STARTER
+      // ==================================================
+
+      if (
+        query.data ===
+        "assinar_starter"
+      ) {
+
+        await bot.sendMessage(
+          chatId,
+          `💠 *PROMATCH STARTER*
 
 💰 Valor: *R$ 49,90*
 📅 Acesso mensal
 
 Clique abaixo para gerar seu pagamento via PIX.`,
-        {
-          parse_mode: "Markdown",
-          reply_markup: {
-            inline_keyboard: [
-              [
-                {
-                  text: "💠 GERAR PIX — R$ 49,90",
-                  callback_data: "gerar_pix"
-                }
-              ],
-              [
-                {
-                  text: "⬅️ VOLTAR",
-                  callback_data: "voltar_inicio"
-                }
+          {
+            parse_mode:
+              "Markdown",
+
+            reply_markup: {
+              inline_keyboard: [
+                [
+                  {
+                    text:
+                      "💠 GERAR PIX — R$ 49,90",
+
+                    callback_data:
+                      "gerar_pix"
+                  }
+                ],
+                [
+                  {
+                    text:
+                      "⬅️ VOLTAR",
+
+                    callback_data:
+                      "voltar_inicio"
+                  }
+                ]
               ]
-            ]
+            }
           }
-        }
-      );
+        );
 
-      return;
-    }
+        return;
+      }
 
-    // ==================================================
-    // BOTÃO GERAR PIX
-    // ==================================================
+      // ==================================================
+      // GERAR PIX
+      // ==================================================
 
-    if (query.data === "gerar_pix") {
-      await bot.sendMessage(
-        chatId,
-        `⏳ *Gerando seu pagamento PIX...*
+      if (
+        query.data ===
+        "gerar_pix"
+      ) {
+
+        await bot.sendMessage(
+          chatId,
+          `⏳ *Gerando seu pagamento PIX...*
 
 Aguarde alguns segundos.`,
-        {
-          parse_mode: "Markdown"
-        }
-      );
-
-      console.log(
-        `Solicitação de PIX recebida. Telegram ID: ${telegramId}`
-      );
-
-      // Nesta etapa ainda não estamos criando
-      // a cobrança real no Asaas.
-      //
-      // No próximo passo, este botão fará:
-      //
-      // 1. Criar/identificar cliente no Asaas
-      // 2. Criar cobrança PIX de R$ 49,90
-      // 3. Salvar Telegram ID no externalReference
-      // 4. Buscar o PIX copia e cola
-      // 5. Enviar para o usuário
-
-      await bot.sendMessage(
-        chatId,
-        `✅ *Usuário identificado corretamente.*
-
-Seu Telegram ID:
-
-\`${telegramId}\`
-
-A estrutura do bot está funcionando.
-
-No próximo passo, este botão será conectado à API do Asaas para gerar o PIX automaticamente.`,
-        {
-          parse_mode: "Markdown",
-          reply_markup: {
-            inline_keyboard: [
-              [
-                {
-                  text: "⬅️ VOLTAR AO PLANO",
-                  callback_data: "assinar_starter"
-                }
-              ]
-            ]
+          {
+            parse_mode:
+              "Markdown"
           }
+        );
+
+        // ------------------------------
+        // 1. CRIAR CLIENTE
+        // ------------------------------
+
+        const cliente =
+          await criarClienteAsaas(
+            query.from
+          );
+
+        console.log(
+          "Cliente Asaas criado:",
+          cliente.id
+        );
+
+        // ------------------------------
+        // 2. CRIAR COBRANÇA
+        // ------------------------------
+
+        const cobranca =
+          await criarCobrancaPix(
+            cliente.id,
+            telegramId
+          );
+
+        console.log(
+          "Cobrança criada:",
+          cobranca.id
+        );
+
+        // ------------------------------
+        // 3. BUSCAR PIX
+        // ------------------------------
+
+        const pix =
+          await buscarPix(
+            cobranca.id
+          );
+
+        console.log(
+          "PIX gerado para:",
+          telegramId
+        );
+
+        // ------------------------------
+        // 4. ENVIAR PIX
+        // ------------------------------
+
+        await bot.sendMessage(
+          chatId,
+          `💠 *Pagamento PIX*
+
+⭐ Plano: *STARTER*
+
+💰 Valor:
+*R$ 49,90*
+
+Copie o código PIX abaixo:
+
+\`${pix.payload}\`
+
+Depois de realizar o pagamento, clique em:
+
+*JÁ PAGUEI*`,
+          {
+            parse_mode:
+              "Markdown",
+
+            reply_markup: {
+              inline_keyboard: [
+                [
+                  {
+                    text:
+                      "✅ JÁ PAGUEI",
+
+                    callback_data:
+                      `verificar_${cobranca.id}`
+                  }
+                ],
+                [
+                  {
+                    text:
+                      "⬅️ VOLTAR",
+
+                    callback_data:
+                      "voltar_inicio"
+                  }
+                ]
+              ]
+            }
+          }
+        );
+
+        return;
+      }
+
+      // ==================================================
+      // VERIFICAR PAGAMENTO
+      // ==================================================
+
+      if (
+        query.data.startsWith(
+          "verificar_"
+        )
+      ) {
+
+        const paymentId =
+          query.data.replace(
+            "verificar_",
+            ""
+          );
+
+        const pagamento =
+          await consultarPagamento(
+            paymentId
+          );
+
+        console.log(
+          "Status pagamento:",
+          pagamento.status
+        );
+
+        if (
+          pagamento.status ===
+            "RECEIVED" ||
+          pagamento.status ===
+            "CONFIRMED"
+        ) {
+
+          await liberarAcesso(
+            telegramId
+          );
+
+          return;
         }
-      );
 
-      return;
-    }
+        await bot.sendMessage(
+          chatId,
+          `⏳ *Pagamento ainda não identificado.*
 
-    // ==================================================
-    // BOTÃO VOLTAR
-    // ==================================================
+Caso você tenha acabado de realizar o PIX, aguarde alguns segundos e tente novamente.`,
+          {
+            parse_mode:
+              "Markdown",
 
-    if (query.data === "voltar_inicio") {
-      await bot.sendMessage(
-        chatId,
-        `🚀 *PROMATCH*
+            reply_markup: {
+              inline_keyboard: [
+                [
+                  {
+                    text:
+                      "🔄 VERIFICAR NOVAMENTE",
+
+                    callback_data:
+                      `verificar_${paymentId}`
+                  }
+                ]
+              ]
+            }
+          }
+        );
+
+        return;
+      }
+
+      // ==================================================
+      // VOLTAR
+      // ==================================================
+
+      if (
+        query.data ===
+        "voltar_inicio"
+      ) {
+
+        await bot.sendMessage(
+          chatId,
+          `🚀 *PROMATCH*
 
 Escolha seu plano:
 
 ⭐ *STARTER*
 💰 *R$ 49,90/mês*`,
-        {
-          parse_mode: "Markdown",
-          reply_markup: {
-            inline_keyboard: [
-              [
-                {
-                  text: "⭐ STARTER — R$ 49,90",
-                  callback_data: "assinar_starter"
-                }
+          {
+            parse_mode:
+              "Markdown",
+
+            reply_markup: {
+              inline_keyboard: [
+                [
+                  {
+                    text:
+                      "⭐ STARTER — R$ 49,90",
+
+                    callback_data:
+                      "assinar_starter"
+                  }
+                ]
               ]
-            ]
+            }
           }
-        }
+        );
+
+        return;
+      }
+
+    } catch (error) {
+
+      console.error(
+        "Erro ao processar botão:",
+        error.response?.data ||
+        error.message
       );
 
-      return;
-    }
+      try {
 
-    // ==================================================
-    // CALLBACK NÃO RECONHECIDO
-    // ==================================================
-
-    console.log(
-      `Callback não reconhecido: ${query.data}`
-    );
-
-  } catch (error) {
-    console.error(
-      "Erro ao processar botão:",
-      error.response?.data || error.message
-    );
-
-    try {
-      await bot.sendMessage(
-        chatId,
-        `❌ Ocorreu um problema ao processar sua solicitação.
+        await bot.sendMessage(
+          chatId,
+          `❌ Não foi possível concluir esta operação.
 
 Tente novamente em alguns instantes.`
-      );
-    } catch (telegramError) {
-      console.error(
-        "Erro ao enviar mensagem de erro:",
-        telegramError.message
-      );
+        );
+
+      } catch (
+        telegramError
+      ) {
+
+        console.error(
+          "Erro Telegram:",
+          telegramError.message
+        );
+
+      }
+
     }
+
   }
-});
+);
 
 // ======================================================
 // WEBHOOK ASAAS
 // ======================================================
 
-app.post("/webhook/asaas", async (req, res) => {
-  try {
-    const event = req.body;
+app.post(
+  "/webhook/asaas",
+  async (req, res) => {
 
-    console.log(
-      "Webhook recebido do Asaas:",
-      event?.event || "evento não identificado"
-    );
+    try {
 
-    // Respondemos imediatamente para o Asaas
-    res.sendStatus(200);
+      const event =
+        req.body;
 
-    // No próximo passo adicionaremos aqui:
-    //
-    // PAYMENT_RECEIVED
-    // ↓
-    // externalReference
-    // ↓
-    // Telegram ID
-    // ↓
-    // criar convite do grupo
-    // ↓
-    // enviar convite ao usuário
+      console.log(
+        "Webhook Asaas:",
+        event?.event
+      );
 
-  } catch (error) {
+      // Respondemos rápido
+      res.sendStatus(200);
+
+      // Só interessa pagamento confirmado/recebido
+      if (
+        event.event !==
+          "PAYMENT_RECEIVED" &&
+        event.event !==
+          "PAYMENT_CONFIRMED"
+      ) {
+        return;
+      }
+
+      const payment =
+        event.payment;
+
+      const reference =
+        payment?.externalReference;
+
+      if (
+        !reference ||
+        !reference.startsWith(
+          "telegram_"
+        )
+      ) {
+
+        console.log(
+          "Pagamento sem Telegram ID."
+        );
+
+        return;
+      }
+
+      const telegramId =
+        reference.replace(
+          "telegram_",
+          ""
+        );
+
+      console.log(
+        "Pagamento confirmado para Telegram:",
+        telegramId
+      );
+
+      await liberarAcesso(
+        telegramId
+      );
+
+    } catch (error) {
+
+      console.error(
+        "Erro no Webhook:",
+        error.response?.data ||
+        error.message
+      );
+
+    }
+
+  }
+);
+
+// ======================================================
+// ERROS TELEGRAM
+// ======================================================
+
+bot.on(
+  "polling_error",
+  (error) => {
+
     console.error(
-      "Erro no webhook Asaas:",
+      "Telegram polling error:",
       error.message
     );
 
-    if (!res.headersSent) {
-      res.sendStatus(500);
-    }
   }
-});
+);
 
 // ======================================================
-// ERROS DO TELEGRAM
+// SERVIDOR
 // ======================================================
 
-bot.on("polling_error", (error) => {
-  console.error(
-    "Telegram polling error:",
-    error.message
-  );
-});
+app.listen(
+  PORT,
+  () => {
 
-// ======================================================
-// ERROS GERAIS DO PROCESSO
-// ======================================================
+    console.log(
+      `Servidor PROMATCH rodando na porta ${PORT}`
+    );
 
-process.on("unhandledRejection", (reason) => {
-  console.error(
-    "Unhandled Rejection:",
-    reason
-  );
-});
-
-process.on("uncaughtException", (error) => {
-  console.error(
-    "Uncaught Exception:",
-    error
-  );
-});
-
-// ======================================================
-// INICIAR SERVIDOR
-// ======================================================
-
-app.listen(PORT, () => {
-  console.log(
-    `Servidor PROMATCH rodando na porta ${PORT}`
-  );
-});
+  }
+);
