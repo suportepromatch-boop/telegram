@@ -16,10 +16,15 @@ const TELEGRAM_GROUP_ID = process.env.TELEGRAM_GROUP_ID;
 const ASAAS_API_KEY = process.env.ASAAS_API_KEY;
 const ASAAS_WEBHOOK_TOKEN = process.env.ASAAS_WEBHOOK_TOKEN;
 
+// Sua chave PIX criada no Asaas
+const ASAAS_PIX_KEY =
+  process.env.ASAAS_PIX_KEY ||
+  "79b96cef-1cce-4c36-a5a6-c0e2cbf4c826";
+
 const ASAAS_API_URL = "https://api.asaas.com/v3";
 
 // ======================================================
-// VALIDAÇÃO DAS VARIÁVEIS
+// VALIDAÇÕES
 // ======================================================
 
 if (!TELEGRAM_BOT_TOKEN) {
@@ -33,16 +38,34 @@ if (!ASAAS_API_KEY) {
 }
 
 if (!TELEGRAM_GROUP_ID) {
-  console.warn(
-    "AVISO: TELEGRAM_GROUP_ID ainda não configurado."
-  );
+  console.warn("AVISO: TELEGRAM_GROUP_ID não configurado.");
 }
 
 if (!ASAAS_WEBHOOK_TOKEN) {
-  console.warn(
-    "AVISO: ASAAS_WEBHOOK_TOKEN ainda não configurado."
-  );
+  console.warn("AVISO: ASAAS_WEBHOOK_TOKEN não configurado.");
 }
+
+// ======================================================
+// MEMÓRIA TEMPORÁRIA
+// ======================================================
+
+// QR Code ID -> Telegram ID
+//
+// Exemplo:
+// "9bea9bcd..." => "123456789"
+//
+// IMPORTANTE:
+// Essa estrutura é suficiente para testar.
+// Depois vamos trocar por banco de dados para sobreviver
+// a reinícios do Render.
+const qrCodeUsuarios = new Map();
+
+// Telegram ID -> QR Code atual
+const usuarioQrCodeAtual = new Map();
+
+// QR Codes que já tiveram acesso liberado.
+// Evita liberar duas vezes pelo mesmo evento.
+const qrCodesLiberados = new Set();
 
 // ======================================================
 // CLIENTE ASAAS
@@ -50,12 +73,10 @@ if (!ASAAS_WEBHOOK_TOKEN) {
 
 const asaas = axios.create({
   baseURL: ASAAS_API_URL,
-
   headers: {
     access_token: ASAAS_API_KEY,
     "Content-Type": "application/json"
   },
-
   timeout: 15000
 });
 
@@ -73,7 +94,7 @@ const bot = new TelegramBot(
 console.log("PROMATCH Bot iniciado.");
 
 // ======================================================
-// SERVIDOR EXPRESS
+// EXPRESS
 // ======================================================
 
 const app = express();
@@ -85,75 +106,36 @@ app.use(express.json());
 // ======================================================
 
 app.get("/", (req, res) => {
-  res
-    .status(200)
-    .send("PROMATCH Bot online.");
+  res.status(200).send("PROMATCH Bot online.");
 });
 
 // ======================================================
-// FUNÇÃO AUXILIAR: DATA YYYY-MM-DD
+// CRIAR QR CODE PIX ESTÁTICO
 // ======================================================
 
-function dataHoje() {
-  return new Date()
-    .toISOString()
-    .split("T")[0];
-}
-
-// ======================================================
-// FUNÇÃO: CRIAR CLIENTE NO ASAAS
-// ======================================================
-
-async function criarClienteAsaas(usuario) {
-
-  const telegramId = usuario.id;
-
-  const nome =
-    [
-      usuario.first_name,
-      usuario.last_name
-    ]
-      .filter(Boolean)
-      .join(" ") ||
-    `Telegram ${telegramId}`;
+async function criarQrCodePix(telegramId) {
 
   const response = await asaas.post(
-    "/customers",
+    "/pix/qrCodes/static",
     {
-      name: nome,
-
-      externalReference:
-        `telegram_${telegramId}`,
-
-      notificationDisabled: true
-    }
-  );
-
-  return response.data;
-}
-
-// ======================================================
-// FUNÇÃO: CRIAR COBRANÇA PIX
-// ======================================================
-
-async function criarCobrancaPix(
-  customerId,
-  telegramId
-) {
-
-  const response = await asaas.post(
-    "/payments",
-    {
-      customer: customerId,
-
-      billingType: "PIX",
-
-      value: 49.90,
-
-      dueDate: dataHoje(),
+      addressKey: ASAAS_PIX_KEY,
 
       description:
-        "PROMATCH STARTER - assinatura mensal",
+        "PROMATCH STARTER",
+
+      value:
+        49.90,
+
+      format:
+        "ALL",
+
+      // QR exclusivo para uma única assinatura
+      allowsMultiplePayments:
+        false,
+
+      // 30 minutos
+      expirationSeconds:
+        1800,
 
       externalReference:
         `telegram_${telegramId}`
@@ -164,35 +146,28 @@ async function criarCobrancaPix(
 }
 
 // ======================================================
-// FUNÇÃO: BUSCAR PIX COPIA E COLA
+// CONSULTAR PAGAMENTOS DO QR CODE
 // ======================================================
 
-async function buscarPix(paymentId) {
-
-  const response = await asaas.get(
-    `/payments/${paymentId}/pixQrCode`
-  );
-
-  return response.data;
-}
-
-// ======================================================
-// FUNÇÃO: CONSULTAR PAGAMENTO
-// ======================================================
-
-async function consultarPagamento(
-  paymentId
+async function consultarPagamentosQrCode(
+  pixQrCodeId
 ) {
 
   const response = await asaas.get(
-    `/payments/${paymentId}`
+    "/payments",
+    {
+      params: {
+        pixQrCodeId:
+          pixQrCodeId
+      }
+    }
   );
 
   return response.data;
 }
 
 // ======================================================
-// FUNÇÃO: GERAR CONVITE DO GRUPO
+// GERAR CONVITE INDIVIDUAL
 // ======================================================
 
 async function gerarConviteGrupo() {
@@ -215,12 +190,28 @@ async function gerarConviteGrupo() {
 }
 
 // ======================================================
-// FUNÇÃO: LIBERAR ACESSO
+// LIBERAR ACESSO
 // ======================================================
 
 async function liberarAcesso(
-  telegramId
+  telegramId,
+  pixQrCodeId
 ) {
+
+  // Evita duplicidade de liberação
+  if (
+    pixQrCodeId &&
+    qrCodesLiberados.has(
+      pixQrCodeId
+    )
+  ) {
+
+    console.log(
+      `Acesso já liberado para QR Code ${pixQrCodeId}`
+    );
+
+    return;
+  }
 
   const inviteLink =
     await gerarConviteGrupo();
@@ -235,7 +226,8 @@ Você já pode acessar nossa área exclusiva.
 
 Clique abaixo para entrar:`,
     {
-      parse_mode: "Markdown",
+      parse_mode:
+        "Markdown",
 
       reply_markup: {
         inline_keyboard: [
@@ -251,6 +243,18 @@ Clique abaixo para entrar:`,
         ]
       }
     }
+  );
+
+  if (pixQrCodeId) {
+
+    qrCodesLiberados.add(
+      pixQrCodeId
+    );
+
+  }
+
+  console.log(
+    `Acesso liberado para Telegram ${telegramId}`
   );
 }
 
@@ -376,9 +380,9 @@ bot.on(
         query.id
       );
 
-      // ================================================
+      // ==================================================
       // STARTER
-      // ================================================
+      // ==================================================
 
       if (
         query.data ===
@@ -425,9 +429,9 @@ Clique abaixo para gerar seu pagamento via PIX.`,
         return;
       }
 
-      // ================================================
+      // ==================================================
       // GERAR PIX
-      // ================================================
+      // ==================================================
 
       if (
         query.data ===
@@ -445,49 +449,42 @@ Aguarde alguns segundos.`,
           }
         );
 
-        // ==============================================
-        // CRIAR CLIENTE ASAAS
-        // ==============================================
-
-        const cliente =
-          await criarClienteAsaas(
-            query.from
-          );
-
-        console.log(
-          `Cliente Asaas criado: ${cliente.id}`
-        );
-
-        // ==============================================
-        // CRIAR COBRANÇA
-        // ==============================================
-
-        const cobranca =
-          await criarCobrancaPix(
-            cliente.id,
+        const qrCode =
+          await criarQrCodePix(
             telegramId
           );
 
-        console.log(
-          `Cobrança criada: ${cobranca.id}`
-        );
+        if (
+          !qrCode ||
+          !qrCode.id ||
+          !qrCode.payload
+        ) {
 
-        // ==============================================
-        // BUSCAR PIX
-        // ==============================================
-
-        const pix =
-          await buscarPix(
-            cobranca.id
+          console.error(
+            "Resposta inesperada do QR Code:",
+            qrCode
           );
 
+          throw new Error(
+            "Asaas não retornou id/payload do QR Code."
+          );
+        }
+
         console.log(
-          `PIX criado para Telegram ${telegramId}`
+          `QR Code criado: ${qrCode.id}`
         );
 
-        // ==============================================
-        // ENVIAR PIX
-        // ==============================================
+        // Salva vínculo:
+        // QR Code -> Telegram
+        qrCodeUsuarios.set(
+          qrCode.id,
+          String(telegramId)
+        );
+
+        usuarioQrCodeAtual.set(
+          String(telegramId),
+          qrCode.id
+        );
 
         await bot.sendMessage(
           chatId,
@@ -499,9 +496,11 @@ Aguarde alguns segundos.`,
 💰 Valor:
 *R$ 49,90*
 
+⏱ Este PIX é válido por aproximadamente *30 minutos*.
+
 Copie o código PIX abaixo:
 
-\`${pix.payload}\`
+\`${qrCode.payload}\`
 
 Após realizar o pagamento, clique em:
 
@@ -518,16 +517,16 @@ Após realizar o pagamento, clique em:
                       "✅ JÁ PAGUEI",
 
                     callback_data:
-                      `verificar_${cobranca.id}`
+                      `verificarqr_${qrCode.id}`
                   }
                 ],
                 [
                   {
                     text:
-                      "⬅️ VOLTAR",
+                      "🔄 GERAR NOVO PIX",
 
                     callback_data:
-                      "voltar_inicio"
+                      "gerar_pix"
                   }
                 ]
               ]
@@ -538,40 +537,71 @@ Após realizar o pagamento, clique em:
         return;
       }
 
-      // ================================================
-      // VERIFICAR PAGAMENTO
-      // ================================================
+      // ==================================================
+      // VERIFICAR QR CODE
+      // ==================================================
 
       if (
         query.data.startsWith(
-          "verificar_"
+          "verificarqr_"
         )
       ) {
 
-        const paymentId =
+        const pixQrCodeId =
           query.data.replace(
-            "verificar_",
+            "verificarqr_",
             ""
           );
 
-        const pagamento =
-          await consultarPagamento(
-            paymentId
+        // Segurança:
+        // o QR precisa ter sido gerado por esse usuário
+        const donoDoQr =
+          qrCodeUsuarios.get(
+            pixQrCodeId
           );
 
-        console.log(
-          `Status pagamento ${paymentId}: ${pagamento.status}`
-        );
+        if (
+          donoDoQr &&
+          donoDoQr !==
+            String(telegramId)
+        ) {
+
+          await bot.sendMessage(
+            chatId,
+            `❌ Este pagamento não pertence ao seu usuário.`
+          );
+
+          return;
+        }
+
+        const resultado =
+          await consultarPagamentosQrCode(
+            pixQrCodeId
+          );
+
+        const pagamentos =
+          Array.isArray(
+            resultado?.data
+          )
+            ? resultado.data
+            : [];
+
+        const pagamentoRecebido =
+          pagamentos.find(
+            (pagamento) =>
+              pagamento.status ===
+                "RECEIVED" ||
+              pagamento.status ===
+                "CONFIRMED"
+          );
 
         if (
-          pagamento.status ===
-            "RECEIVED" ||
-          pagamento.status ===
-            "CONFIRMED"
+          pagamentoRecebido
         ) {
 
           await liberarAcesso(
-            telegramId
+            telegramId,
+            pixQrCodeId
           );
 
           return;
@@ -581,7 +611,7 @@ Após realizar o pagamento, clique em:
           chatId,
           `⏳ *Pagamento ainda não identificado.*
 
-Caso você tenha acabado de realizar o PIX, aguarde alguns segundos e tente novamente.`,
+Caso tenha acabado de realizar o PIX, aguarde alguns segundos e tente novamente.`,
           {
             parse_mode:
               "Markdown",
@@ -594,7 +624,7 @@ Caso você tenha acabado de realizar o PIX, aguarde alguns segundos e tente nova
                       "🔄 VERIFICAR NOVAMENTE",
 
                     callback_data:
-                      `verificar_${paymentId}`
+                      `verificarqr_${pixQrCodeId}`
                   }
                 ]
               ]
@@ -605,9 +635,9 @@ Caso você tenha acabado de realizar o PIX, aguarde alguns segundos e tente nova
         return;
       }
 
-      // ================================================
+      // ==================================================
       // VOLTAR
-      // ================================================
+      // ==================================================
 
       if (
         query.data ===
@@ -662,10 +692,12 @@ Escolha seu plano:
 Tente novamente em alguns instantes.`
         );
 
-      } catch (telegramError) {
+      } catch (
+        telegramError
+      ) {
 
         console.error(
-          "Erro ao enviar mensagem:",
+          "Erro Telegram:",
           telegramError.message
         );
 
@@ -686,16 +718,18 @@ app.post(
 
     try {
 
-      // ================================================
-      // VALIDAR TOKEN DO WEBHOOK
-      // ================================================
+      // ==================================================
+      // VALIDAR TOKEN DO ASAAS
+      // ==================================================
 
       const receivedToken =
         req.headers[
           "asaas-access-token"
         ];
 
-      if (!ASAAS_WEBHOOK_TOKEN) {
+      if (
+        !ASAAS_WEBHOOK_TOKEN
+      ) {
 
         console.error(
           "ASAAS_WEBHOOK_TOKEN não configurado."
@@ -715,7 +749,7 @@ app.post(
       ) {
 
         console.warn(
-          "Webhook bloqueado: token inválido."
+          "Webhook rejeitado: token inválido."
         );
 
         return res
@@ -725,9 +759,9 @@ app.post(
           );
       }
 
-      // ================================================
-      // TOKEN VÁLIDO
-      // ================================================
+      // ==================================================
+      // EVENTO AUTORIZADO
+      // ==================================================
 
       const event =
         req.body;
@@ -736,18 +770,12 @@ app.post(
         `Webhook autorizado: ${event?.event}`
       );
 
-      /*
-       * Respondemos rapidamente ao Asaas.
-       *
-       * Depois dessa resposta, continuamos
-       * processando o evento.
-       */
-
+      // Respondemos imediatamente ao Asaas
       res.sendStatus(200);
 
-      // ================================================
-      // EVENTOS QUE NOS INTERESSAM
-      // ================================================
+      // ==================================================
+      // SÓ EVENTOS DE PAGAMENTO
+      // ==================================================
 
       if (
         event.event !==
@@ -771,47 +799,82 @@ app.post(
         return;
       }
 
-      // ================================================
-      // EXTERNAL REFERENCE
-      // ================================================
+      // ==================================================
+      // PEGAR ID DO QR CODE
+      // ==================================================
 
-      const reference =
-        payment.externalReference;
+      const pixQrCodeId =
+        payment.pixQrCodeId;
 
-      if (
-        !reference ||
-        !reference.startsWith(
-          "telegram_"
-        )
-      ) {
+      if (!pixQrCodeId) {
 
-        console.warn(
-          "Pagamento sem externalReference de Telegram."
+        console.log(
+          "Pagamento recebido sem pixQrCodeId."
         );
 
         return;
       }
 
-      // ================================================
-      // IDENTIFICAR TELEGRAM ID
-      // ================================================
-
-      const telegramId =
-        reference.replace(
-          "telegram_",
-          ""
-        );
-
       console.log(
-        `Pagamento confirmado para Telegram ${telegramId}`
+        `Pagamento recebido para QR Code ${pixQrCodeId}`
       );
 
-      // ================================================
-      // LIBERAR GRUPO
-      // ================================================
+      // ==================================================
+      // DESCOBRIR TELEGRAM DONO DO QR
+      // ==================================================
+
+      let telegramId =
+        qrCodeUsuarios.get(
+          pixQrCodeId
+        );
+
+      /*
+       * Tentativa adicional:
+       *
+       * Como criamos o QR Code com externalReference
+       * telegram_ID, verificamos também se o evento
+       * trouxe essa referência.
+       */
+      if (
+        !telegramId &&
+        payment.externalReference &&
+        payment.externalReference.startsWith(
+          "telegram_"
+        )
+      ) {
+
+        telegramId =
+          payment.externalReference.replace(
+            "telegram_",
+            ""
+          );
+
+      }
+
+      if (!telegramId) {
+
+        console.warn(
+          `QR Code ${pixQrCodeId} não encontrado na memória do bot.`
+        );
+
+        /*
+         * Isso pode acontecer caso o Render reinicie
+         * depois de gerar o QR Code e antes do pagamento.
+         *
+         * Quando adicionarmos banco de dados,
+         * esse problema deixa de existir.
+         */
+
+        return;
+      }
+
+      // ==================================================
+      // LIBERAR ACESSO
+      // ==================================================
 
       await liberarAcesso(
-        telegramId
+        telegramId,
+        pixQrCodeId
       );
 
     } catch (error) {
@@ -822,12 +885,9 @@ app.post(
         error.message
       );
 
-      /*
-       * Se já respondemos 200 acima,
-       * não podemos responder novamente.
-       */
-
-      if (!res.headersSent) {
+      if (
+        !res.headersSent
+      ) {
 
         res
           .status(500)
@@ -859,7 +919,7 @@ bot.on(
 );
 
 // ======================================================
-// ERROS NÃO TRATADOS
+// ERROS GERAIS
 // ======================================================
 
 process.on(
