@@ -130,6 +130,26 @@ Clique abaixo para continuar.`,
       return;
     }
 
+    // ======================================================
+// DESCOBRIR ID DO GRUPO
+// ======================================================
+
+bot.onText(/\/id/, async (msg) => {
+  const chatId = msg.chat.id;
+  const chatType = msg.chat.type;
+
+  await bot.sendMessage(
+    chatId,
+    `🔎 ID deste chat:
+
+\`${chatId}\`
+
+Tipo: ${chatType}`,
+    {
+      parse_mode: "Markdown"
+    }
+  );
+});
     // ==================================================
     // GERAR PIX
     // ==================================================
